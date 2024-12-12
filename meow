@@ -1,0 +1,352 @@
+M 				EQU 14 ; номер по БАРСу 
+G 				EQU 21 ; номер группы 
+
+RAM 			EQU 0C000h ;адрес, обращение озу
+	
+START_BUFF 		EQU 0000h ;адрес, начало буффера
+END_BUFF 		EQU 0DACh ;адрес, конец буффера
+
+KBO 			EQU 9000h ;порт для клавиатуры
+
+KBI				EQU P0
+KB_OFFSET  		EQU 4 ; смещение для вычисления нажатой клавиши по скан-коду 
+TEST_KEY  		EQU 0Ah ; значение клавиши "TECT" на клавиатуре 
+RESET_KEY  		EQU 0Bh ; значение клавиши "СБРОС" на клавиатуре 
+NULL_KEY   		EQU 0E0h ; значение ненажатой клавиши на клавиатуре 
+
+IND 			EQU 5000h ;адрес индикатора
+
+LED1 			EQU P3.0 ;порт 1 светодиода красный
+LED2 			EQU P3.1 ;порт 2 светодиода зеленый
+
+Y1 				EQU P3.4 ;порт для стробирующего сигнала
+Y2 				EQU P1.7 ;порт для сигнала управлющего воздействия
+
+IS_FIRST_WRITE  EQU 20h ; флаг, показывающий, что ни одной записи в ОЗУ еще не было 
+BUFFER_EMPTY 	EQU 20h ; флаг, показывающий, что ни одной записи в ОЗУ еще не было
+	
+; временные константы: 
+T_Y1  			EQU 10*G + M      ; время для строба Y1 
+	
+DSEG AT 30h 
+Q:            	DS 1 ; величина введенная с клавиатуры 
+err_code:     	DS 1 ; номер ошибки, который будет выведен на СДИ 
+tail:         	DS 2 ; адрес конца кольцевого буфера 
+head:         	DS 2 ; адрес начала кольцевого буфера 
+current_key:  	DS 1 ; значение последней нажатой клавиши 
+pressed_key: 	DS 1 ; значения нажатой клавиши 
+X2:          	DS 1 ; значение, c внешнего устройства
+	
+CSEG    
+	jmp init
+	
+ORG 03h 
+    JMP    INT_KEYBOARD ; прерывание INT0 - клавиатура 
+ORG 13h 
+    JMP    INT_WRITE_RAM ; прерывание INT1 - запись в буфер из внешнего устройства 	
+ORG 60h 
+digits:  DB 00111111b, 00000110b, 01011011b, 01001111b, 01100110b, 01101101b, 01111101b, 00000111b, 01111111b, 01101111b 
+columns: DB 00000110b, 00000101b, 00000011b 
+
+main: 
+    MOV     A, err_code                     ; получение кода ошибки 
+    JNZ     err_handle                      ; если код ошибки не ноль — переход по метке 
+    MOV     A, current_key                  ; получение значения последней нажатой клавиши 
+    CJNE    A, #NULL_KEY, key_handle        ; если клавиша была нажата — переход по метке 
+    JMP     end_handle                      ; иначе — переход по метке 
+	
+key_handle: 
+    SUBB    A, #10                          ; определение класса нажатой клавиши: цифры или служебные 
+    JC      digit_handle                    ; если цифра — переход по метке 
+    MOV     A, current_key                  ; получение значения последней нажатой клавиши 
+	SUBB    A, #TEST_KEY
+	JZ 		test 		 					;если нажатая клавиша 'ТЕСТ' — переход по метке
+	MOV     A, current_key                  ; получение значения последней нажатой клавиши 
+	SUBB    A, #RESET_KEY
+	JZ	    reset 		 					;если нажатая клавиша 'RESET' — переход по метке	 
+    JMP     end_handle               		; иначе — переход по метке 
+	
+digit_handle:
+	MOV 	A, pressed_key
+    CALL    get_digit                       ; вызов процедуры получения нужной комбинации сегментов для вывода на СДИ 
+    ; подготовка к выводу на СДИ: 
+    MOV     R1, A                           ; цифра  индикатора 
+    CALL    display                         ; вызов процедуры вывода цифр на СДИ 
+    JMP     end_handle                      ; переход по метке  
+	
+err_handle: 
+    CLR     EX0                             ; на время вывода ошибки прерывания от клавиатуры блокируются 
+    MOV     A, err_code 
+    CALL    get_digit 
+    MOV     R1, A                           ; сохранение номера в R1 ошибки для процедуры display 
+    MOV     R2, #01111001b                  ; сохранение символа "Е" в R2 для процедуры display 
+    CALL    display                         ; вызов процедуры вывода цифры на СДИ 
+    SETB    EX0                             ; разрешение прерываний от клавиатуры 
+    JMP     end_handle  
+	
+test:
+    ; настройка таймера на отсчет T_Y1 
+    CLR     Y1                        ; выставляем строб в активное состояние (лог. 0) 
+    MOV     TH0, #high(65535 - T_Y1)  ; настройка таймера на нужную длительность строба 
+    MOV     TL0, #low(65535 - T_Y1)   ; настройка таймера на нужную длительность строба  
+    SETB    TR0                       ; включение таймера на отсчет длительности строба 
+	OjidanTimer:
+		jnb TF0, test    		      ;Подождать пока не переполнится таймер
+	clr 	tf0
+	SETB 	Y1
+	JMP  	end_handle 
+	
+reset: 
+	CALL 	set_led_buffer_empty
+	MOV     R2, #high(START_BUFF)      ; получение старшей части конца буфера 
+    MOV     R1, #low(START_BUFF)       ; получение младшей части конца буфера 
+	MOV		R0, #head
+	CALL 	write_pointer
+	MOV		R0, #tail
+	CALL 	write_pointer
+	SETB 	BUFFER_EMPTY
+	SETB	IS_FIRST_WRITE
+	
+end_handle: 
+    MOV     current_key, #NULL_KEY          ; нажатая клавиша обнуляется 
+    JMP     main                            ; переход по метке
+
+
+;<-----------------------------------------init------------------------------------------------->
+init: 
+	CLR     EA                     ; запрет всех прерываний 
+	; инициализация переменных 
+	MOV     Q, #0                  ; по умолчанию равняется 0
+	MOV     tail, #START_BUFF      ; инициализируем указатель на начало буфера 
+	MOV     head, #START_BUFF      ; инициализируем указатель на конец буфера 
+	SETB    IS_FIRST_WRITE         ; указываем, что ни одной записи во внешнее ОЗУ еще не было 
+	SETB    BUFFER_EMPTY	       ; указываем, буффер пуст
+	CALL	set_led_buffer_empty   ; включаем зеленый светодиод
+	 
+	MOV     KBI, #0                ; инициализация клавиатуры 
+	
+	; настройка режимов прерываний 
+	MOV     IE, #00000111b         ; разрешение прерываний от таймера-счетчика 0, внешних INT0, INT1
+	SETB    IT0                    ; прерывание INT0 по спаду сигнала (1 —> 0), чтобы при зажатой клавише не генерировалось повторное прерывание 
+	 
+	MOV     TMOD, #00000001b       ; настройка таймера-0 и таймера-1 на режимы 16-битного счетчика 
+	
+	SETB    Y1                      ; установка строба Y1 в неактивное состояние 
+	SETB    Y2                      ; установка управляющего сигнала в неактивное состояние
+	
+	SETB 	EA
+	
+	JMP     main                    ; переход в основной цикл программы
+
+get_digit: 
+    MOV     DPTR, #digits   ; получение адреса для чтения массива комбинаций digits 
+    MOVC    A, @A+DPTR      ; извлечение комбинации бит, соответствующей нажатой цифре 
+RET
+
+display: 
+    MOV     A, R1       ; получение значения, которое надо отобразить на индикаторе 
+    MOV     DPTR, #IND ; указатель DPTR на IND - адрес регистра индикатора 
+    MOVX    @DPTR, A    ; пересылка во внешнюю память (в регистр первого индикатора) 
+RET  
+
+INT_KEYBOARD: 
+    CLR     EX0                        ; запрет прерываний от клавиатуры 
+    MOV     R3, KBI                    ; 
+    MOV     R2, #0                     ; инициализация R2 нулём 
+scan_loop: 
+    MOV     A, R2                      ; получение значения счетчика столбцов 
+    MOV     DPTR, #columns             ; получение адреса для чтения массива комбинаций digits 
+    MOVC    A, @A+DPTR                 ; извлечение комбинации текущего столбца для клавиатуры 
+     
+    MOV     KBI, A                     ; активация текущего столбца 
+  
+    MOV     DPTR, #KBO                 ; установка адреса регистра значения строк клавиатуры 
+    MOVX    A, @DPTR                   ; получение комбинации строк текущего столбца 
+    ANL     A, #NULL_KEY               ; получение только действительных значений строк столбца 
+    MOV     R1, A                      ; сохранение комбинации строк 
+    CJNE    A, #NULL_KEY, scan_success ; если A != NULL_KEY — переход по метке 
+    INC     R2                         ; иначе — переход к следующему столбцу (+1) 
+    CJNE    R2, #3, scan_loop          ; пока R2 != 3 — переход по метке 
+    JMP     scan_error                 ; переход по метке 
+     
+scan_success: 
+    MOV     A, R2                      ; получение текущего номера столбца 
+kb_row_0: 
+    CJNE    R1, #00001110b, kb_row_1   ; возможные клавиши: 0, 1, 2
+    JMP     scan_end 
+     
+kb_row_1: 
+    CJNE    R1, #00001101b, kb_row_2   ; возможные клавиши: 3, 4, 5, 
+    ADD     A, #KB_OFFSET              ; смещение (+4), условно кнопка 5 – нулевая 
+    JMP     scan_end 
+kb_row_2: 
+    CJNE    R1, #00001011b, kb_row_3 ; возможные клавиши: 6, 7, 8,
+    ADD     A, #KB_OFFSET*2            ; смещение (+8), условно кнопка 8 – нулевая 
+    JMP     scan_end 
+kb_row_3: 
+    CJNE    R1, #00000111b, scan_error ; возможные клавиши: 9, Т, С
+    ADD     A, #KB_OFFSET*3            ; смещение (+12), условно кнопка С – нулевая 
+    JMP     scan_end 
+	
+scan_error: 
+    MOV     A, #NULL_KEY               ; установка "ненажатого" значения 
+scan_end:                               
+    MOV     KBI, R3                    ; инициализация клавиатуры, чтобы принять прерывание от любой клавиши 
+    MOV     current_key, A             ; сохранение значение текущей клавиши 
+    SETB    EX0                        ; разрешение прерывания от клавиатуры 
+RETI
+
+write_pointer:
+; обработка переполнения кольцевого буфера 
+    MOV     R4, #high(END_BUFF)      ; получение старшей части конца буфера 
+    MOV     R3, #low(END_BUFF)       ; получение младшей части конца буфера 
+    CALL    address_comparison       ; вызов процедуры сравнения адресов 
+	JNZ 	pointer_not_equal_end
+	
+	MOV R1, #high(START_BUFF)
+	MOV R2, #low(START_BUFF) 
+	
+	pointer_not_equal_end:
+	MOV A, R2
+	MOV @R0, A
+	INC R0 
+	MOV A, R1
+	MOV @R0, A
+RET
+
+
+address_comparison: 
+    ; сравнение старших частей 
+    MOV     A, R2        ; сохранение значения R2 
+    SUBB    A, R4        ; вычитание R4 из R2 с целью поднятия флагов* 
+    JNZ     end_equal    ; если R2 - R4!= 0 — переход по метке 
+    ; сравнение младших частей 
+    MOV     A, R1        ; сохранение значения R1 
+    SUBB    A, R3        ; вычитание R3 из R1 с целью поднятия флагов* 
+end_equal: 
+RET
+
+set_led_buffer_full:
+	CLR LED1 
+	RET
+
+set_led_buffer_empty:
+	CLR LED2 
+	RET 
+
+INT_WRITE_RAM: 
+    JB      IS_FIRST_WRITE, first_write  ; если это первая запись* — переход по метке
+	
+first_write: 
+    CLR     IS_FIRST_WRITE               ; сброс флага первой записи
+	CLR 	BUFFER_EMPTY				 ; буфер больше не пуст
+	SETB 	LED2						 ; выключение зеленого светодиода
+write_to_ram: 
+	MOV     A, head                      ; установка смещения для старшей части адреса "головы" кольцевого буфера 
+    ORL     A, #high(RAM)                ; установка корректного адреса (старшей части) "головы" буфера в RAM для записи 
+    MOV     DPH, A                       ; установка полученного смещения в старшую часть* указателя DPTR 
+    MOV     DPL, head+1                  ; установка смещения для мл. части адреса "головы" кольцевого буфера 
+    MOVX    @DPTR, A                     
+    INC     DPTR                         ; сдвиг по памяти на одну ячейку вправо для "переключения" 
+    INC     DPTR                         ; сдвиг по памяти на одну ячейку вправо для "переключения"
+	
+	; запись нового адреса головы		
+	MOV R1,DPL							 ; новая младшая часть адреса
+	MOV A, DPH							 
+	ANL A, #31							 	
+	MOV R2, A 							 ; новая старшая часть адреса
+	MOV R0, #head						 ; адрес головы
+	CALL write_pointer					 ; вызов процедуры записи головы
+	
+compare_with_tail:
+	MOV R3, tail + 1
+	MOV R4, tail
+	CALL address_comparison	
+	
+	JZ head_eqaul_tail
+	RETI
+head_eqaul_tail:
+	CALL set_led_buffer_full
+	MOV R2, tail
+	MOV R1, tail + 1
+	MOV R0, #tail
+	CALL write_pointer
+	SETB LED1
+
+RETI
+
+READ_FROM_RAM: 
+	
+	JB BUFFER_EMPTY, on_generator1
+	
+	; чтение из буфера
+	MOV     A, tail                      ; установка смещения для старшей части адреса "головы" кольцевого буфера 
+    ORL     A, #high(RAM)                ; установка корректного адреса (старшей части) "головы" буфера в RAM для записи 
+    MOV     DPH, A                       ; установка полученного смещения в старшую часть* указателя DPTR 
+    MOV     DPL, tail+1                  ; установка смещения для мл. части адреса "головы" кольцевого буфера 
+    MOVX    A, @DPTR					 ; чтение из буфера
+	MOV 	X2, A						 ; запись числа из буфера в Х2
+    INC     DPTR                         ; сдвиг по памяти на одну ячейку вправо для "переключения" 
+	
+	; запись нового указателя 
+	MOV R1,DPL
+	MOV A, DPH
+	ANL A, #31
+	MOV R2, A
+	MOV R0, #tail
+	CALL write_pointer
+	
+compare_with_head:
+	MOV R1, tail + 1
+	MOV R2, tail
+	MOV R3, head + 1
+	MOV R4, head
+	CALL address_comparison
+
+	JNZ     on_generator3
+	SETB 	BUFFER_EMPTY
+	JMP 	on_generator3
+generator_handle: 
+	JB BUFFER_EMPTY, on_generator1
+	
+	is_equal_0:
+	MOV		A, Q					     ; получение значения введенного с клавиатуры 
+    SUBB    A, #0                        ; вычитание из А 0
+    JNZ    	is_equal_1                	 ; если A != 0 то переход к следующей проверке 
+    JMP 	on_generator1				 ; иначе переход к созданию Y2 по 1 формуле 
+	
+	is_equal_1:
+	MOV		A, Q					     ; получение значения введенного с клавиатуры 
+	SUBB	A, #1						 ; вычитание из А 1
+	JZ 		on_generator2				 ; если, переход к созданию Y2 по 2 формуле
+	jmp		READ_FROM_RAM
+	
+	
+
+on_generator1:
+	MOV P0,#0
+	JMP end_read 
+	
+on_generator2: 
+	MOV A, #M
+	ADD A, #G
+	ANL A, #127
+	MOV P0, A
+	JMP end_read
+	
+on_generator3: 
+	MOV A, Q
+	ADD A, #M
+	RL A
+	ADD A, X2
+	RR A
+	RR A
+	RR A
+	ANL A, #31
+	MOV P0,A
+	JMP end_read
+end_read: 
+    CLR     IE1                       
+RETI
+
+end
